@@ -29,8 +29,10 @@ def fetch_object(obj_class: str, obj_id: int) -> dict:
     """Fetch single object from Stepik API"""
     api_url = f'{api_host}/api/{obj_class}s/{obj_id}'
     response = requests.get(api_url,
-                            headers={'Authorization': f'Bearer {token}'}).json()
-    return response[f'{obj_class}s'][0]
+                            headers={'Authorization': f'Bearer {token}'})
+    data = response.json()
+    # Stepik API всегда возвращает объекты в списке даже для одного объекта
+    return data[f'{obj_class}s'][0]
 
 
 def fetch_objects(obj_class: str, obj_ids: List[int]) -> List[dict]:
@@ -42,9 +44,19 @@ def fetch_objects(obj_class: str, obj_ids: List[int]) -> List[dict]:
         ids_param = '&'.join(f'ids[]={obj_id}' for obj_id in obj_ids_slice)
         api_url = f'{api_host}/api/{obj_class}s?{ids_param}'
         response = requests.get(api_url,
-                                headers={'Authorization': f'Bearer {token}'}).json()
-        objs += response[f'{obj_class}s']
+                                headers={'Authorization': f'Bearer {token}'})
+        data = response.json()
+        objs += data.get(f'{obj_class}s', [])
     return objs
+
+
+def fetch_step_source(step_id: int) -> dict:
+    """Fetch step source for a specific step"""
+    api_url = f'{api_host}/api/step-sources/{step_id}'
+    response = requests.get(api_url,
+                            headers={'Authorization': f'Bearer {token}'})
+    data = response.json()
+    return data['step-sources'][0]
 
 
 def get_valid_filename(s: str) -> str:
@@ -59,10 +71,10 @@ class Step:
     step_id: int
     step_type: str
     title: str = ''
-    content: Dict[str, Any] = field(default_factory=dict)
+    text: str = ''
 
     @classmethod
-    def from_api(cls, step_data: dict, step_source: dict, position: int) -> 'Step':
+    def from_api(cls, step_data: dict, position: int) -> 'Step':
         """Create Step from API data"""
         step_type = step_data['block']['name']
         # Create title based on step type and position
@@ -91,42 +103,30 @@ class Step:
         else:
             title = f'Шаг {step_type.upper()} {position}'
 
+        # Get text content if available
+        text = step_data['block'].get('text', '')
+
         return cls(
             position=position,
             step_id=step_data['id'],
             step_type=step_type,
             title=title,
-            content=step_source['block']
+            text=text
         )
 
     def to_markdown(self) -> str:
         """Convert step to markdown format"""
         md_lines = []
 
-        # Add step header with type and number (like in left menu)
+        # Add step header with type and number
         md_lines.append(f'## {self.title}')
+        md_lines.append(f'<!-- step_id: {self.step_id} -->')
 
-        # Add step content based on type
-        if self.step_type == 'text':
-            text = self.content.get('text', '')
-            md_lines.append(text)
-        elif self.step_type == 'video':
-            video = self.content.get('video', {})
-            md_lines.append('### Video')
-            if video.get('urls'):
-                for url_info in video['urls']:
-                    md_lines.append(f'[{url_info["quality"]}p]({url_info["url"]})')
-        elif self.step_type == 'choice':
-            md_lines.append(self.content.get('text', ''))
-            options = self.content.get('options', [])
-            if options:
-                md_lines.append('\nOptions:')
-                for i, opt in enumerate(options, 1):
-                    md_lines.append(f'{i}. {opt.get("text", "")}')
-        elif self.step_type == 'code':
-            md_lines.append('```' + self.content.get('code', 'python'))
-            md_lines.append('# Write your code here')
-            md_lines.append('```')
+        # Add step content
+        if self.text:
+            md_lines.append(self.text)
+        else:
+            md_lines.append('*Нет текстового содержания*')
 
         return '\n'.join(md_lines)
 
@@ -146,8 +146,7 @@ class Lesson:
         return f'{self.section_position}.{self.lesson_position}'
 
     @classmethod
-    def from_api(cls, section_pos: int, unit_data: dict, lesson_data: dict,
-                 steps_data: List[dict], steps_source: List[dict]) -> 'Lesson':
+    def from_api(cls, section_pos: int, unit_data: dict, lesson_data: dict) -> 'Lesson':
         """Create Lesson from API data"""
         lesson = cls(
             section_position=section_pos,
@@ -156,14 +155,14 @@ class Lesson:
             title=lesson_data['title']
         )
 
-        # Sort steps by position
-        steps_data.sort(key=lambda x: x['position'])
+        # Get steps for this lesson
+        if lesson_data.get('steps'):
+            steps_data = fetch_objects('step', lesson_data['steps'])
+            steps_data.sort(key=lambda x: x['position'])
 
-        # Create Step objects
-        for i, step_data in enumerate(steps_data, 1):
-            step_source = next((s for s in steps_source if s['id'] == step_data['id']), None)
-            if step_source:
-                step = Step.from_api(step_data, step_source, i)
+            # Create Step objects
+            for i, step_data in enumerate(steps_data, 1):
+                step = Step.from_api(step_data, i)
                 lesson.steps.append(step)
 
         return lesson
@@ -181,6 +180,8 @@ class Lesson:
         for step in self.steps:
             md_lines.append(step.to_markdown())
             md_lines.append('')
+            md_lines.append('---')
+            md_lines.append('')
 
         return '\n'.join(md_lines)
 
@@ -195,8 +196,7 @@ class Section:
 
     @classmethod
     def from_api(cls, section_data: dict, units_data: List[dict],
-                 lessons_data: List[dict], steps_map: Dict[int, List[dict]],
-                 steps_source_map: Dict[int, List[dict]]) -> 'Section':
+                 lessons_map: Dict[int, dict]) -> 'Section':
         """Create Section from API data"""
         section = cls(
             position=section_data['position'],
@@ -210,16 +210,12 @@ class Section:
 
         # Create lessons with correct section position
         for unit in section_units:
-            lesson_data = next((l for l in lessons_data if l['id'] == unit['lesson']), None)
+            lesson_data = lessons_map.get(unit['lesson'])
             if lesson_data:
-                steps = steps_map.get(lesson_data['id'], [])
-                steps_source = steps_source_map.get(lesson_data['id'], [])
                 lesson = Lesson.from_api(
                     section.position,
                     unit,
-                    lesson_data,
-                    steps,
-                    steps_source
+                    lesson_data
                 )
                 section.lessons.append(lesson)
 
@@ -245,41 +241,35 @@ class Course:
             title=course_data['title']
         )
 
+        print(f"  Загружено: курс")
+
         # Get all sections
         sections_data = fetch_objects('section', course_data['sections'])
         sections_data.sort(key=lambda x: x['position'])
+        print(f"  Загружено: {len(sections_data)} секций")
 
         # Get all units
         all_unit_ids = []
         for section in sections_data:
             all_unit_ids.extend(section['units'])
         units_data = fetch_objects('unit', all_unit_ids)
+        print(f"  Загружено: {len(units_data)} юнитов")
 
         # Get all lessons
         all_lesson_ids = [unit['lesson'] for unit in units_data]
         lessons_data = fetch_objects('lesson', all_lesson_ids)
+        print(f"  Загружено: {len(lessons_data)} уроков")
 
-        # Get all steps for each lesson
-        steps_map = {}
-        steps_source_map = {}
-
-        for lesson in lessons_data:
-            if lesson['steps']:
-                steps = fetch_objects('step', lesson['steps'])
-                steps.sort(key=lambda x: x['position'])
-                steps_map[lesson['id']] = steps
-
-                step_sources = fetch_objects('step-source', lesson['steps'])
-                steps_source_map[lesson['id']] = step_sources
+        # Create lessons map for quick access
+        lessons_map = {lesson['id']: lesson for lesson in lessons_data}
 
         # Create sections
         for section_data in sections_data:
+            print(f"  Обработка секции {section_data['position']}: {section_data['title'][:30]}...")
             section = Section.from_api(
                 section_data,
                 units_data,
-                lessons_data,
-                steps_map,
-                steps_source_map
+                lessons_map
             )
             course.sections.append(section)
 
@@ -305,7 +295,7 @@ class Course:
             lines.append('')
 
             for lesson in section.lessons:
-                lines.append(f'{lesson.menu_number}  {lesson.title}')
+                lines.append(f'  {lesson.menu_number}  {lesson.title}')
                 lines.append('')
 
         return '\n'.join(lines)
@@ -422,6 +412,8 @@ def main():
 
     except Exception as e:
         print(f"Ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         print("\nВозможные причины:")
         print("1. Неверный client_id или client_secret")
         print("2. Курс 253149 не существует или недоступен")
